@@ -1,13 +1,12 @@
 """
 main.py
 -------
-Jarvis — Personal AI Assistant
+Sasha — Personal AI Assistant
 Entry point. Wires together:
   - GTK4 window (ui/window.py)
   - Brain / intent parser (brain.py)          — Ollama + Groq fallback
   - Dispatcher / skill router (dispatcher.py)
   - TTS (tts.py)
-  - Voice listener (listener.py)
   - Mobile server (mobile_server.py)           — WiFi phone access
   - Memory / learning (skills/memory.py)
   - Proactive notifications (skills/proactive.py)
@@ -25,8 +24,6 @@ if "PULSE_SERVER" not in os.environ:
 os.environ["ALSA_PLUGIN_DIR"] = ""
 
 import threading
-import numpy as np
-import pyaudio
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -36,8 +33,7 @@ import config
 import brain
 import dispatcher
 import tts
-from ui.window import JarvisWindow, MSG_USER, MSG_JARVIS, MSG_SYSTEM
-from listener import VoiceListener
+from ui.window import SashaWindow, MSG_USER, MSG_JARVIS, MSG_SYSTEM
 
 # Ensure data directories exist
 config.JARVIS_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,18 +46,11 @@ config.VOICES_DIR.mkdir(parents=True, exist_ok=True)
 MAX_HISTORY = 12
 
 
-class JarvisApp(Gtk.Application):
+class SashaApp(Gtk.Application):
 
     def __init__(self):
-        super().__init__(application_id="com.jarvis.assistant")
-        self.window: JarvisWindow | None = None
-        self._listener: VoiceListener | None = None
-
-        # Push-to-talk recording state
-        self._mic_audio: list[np.ndarray] = []
-        self._mic_stream = None
-        self._pa = None
-        self._mic_recording = threading.Event()
+        super().__init__(application_id="com.sasha.assistant")
+        self.window: SashaWindow | None = None
 
         # Serialise LLM calls
         self._processing = threading.Event()
@@ -79,16 +68,13 @@ class JarvisApp(Gtk.Application):
     # ── Startup ───────────────────────────────────────────────────────────────
 
     def do_activate(self):
-        self.window = JarvisWindow(
+        self.window = SashaWindow(
             app=self,
             on_text_input=self._handle_text,
-            on_voice_start=self._voice_start,
-            on_voice_stop=self._voice_stop,
         )
         self.window.present()
 
         tts.start()
-        self._start_wake_listener()
 
         threading.Thread(target=self._startup_tasks, daemon=True).start()
 
@@ -97,6 +83,7 @@ class JarvisApp(Gtk.Application):
         self._check_backends()
         self._start_mobile_server()
         self._start_proactive()
+        self._start_telegram()
 
         # Pre-build file index so the first file search is instant
         try:
@@ -109,27 +96,28 @@ class JarvisApp(Gtk.Application):
     # ── Backend status ────────────────────────────────────────────────────────
 
     def _check_backends(self):
-        ollama_ok = brain.check_ollama_alive()
+        GLib.idle_add(self.window.set_status, "CHECKING MODEL...", "thinking")
+        ollama_ok, ollama_msg = brain.ensure_ollama_model_available(
+            auto_start=True,
+            auto_pull=True,
+        )
         groq_ok   = brain.check_groq_alive()
 
         if ollama_ok:
             label = f"OLLAMA: {config.OLLAMA_MODEL}"
-            try:
-                brain.parse_intent("hello")
-            except Exception:
-                pass
+            GLib.idle_add(self.window.add_message, ollama_msg, MSG_SYSTEM)
         elif groq_ok:
             label = f"GROQ: {config.GROQ_MODEL} (cloud)"
             GLib.idle_add(
                 self.window.add_message,
-                "Ollama offline — using Groq cloud fallback.",
+                f"{ollama_msg} Using Groq cloud fallback.",
                 MSG_SYSTEM,
             )
         else:
             label = "NO LLM — fallback mode"
             GLib.idle_add(
                 self.window.add_message,
-                "No LLM available. Set GROQ_API_KEY or run 'ollama serve'.",
+                f"{ollama_msg} No fallback LLM available.",
                 MSG_SYSTEM,
             )
 
@@ -165,11 +153,25 @@ class JarvisApp(Gtk.Application):
         except Exception as e:
             print(f"[main] Proactive: {e}")
 
+    def _start_telegram(self):
+        try:
+            from telegram_bot import start_telegram_bot
+            if start_telegram_bot():
+                GLib.idle_add(
+                    self.window.add_message,
+                    "Telegram bot active.",
+                    MSG_SYSTEM,
+                )
+        except ImportError:
+            pass  # python-telegram-bot not installed
+        except Exception as e:
+            print(f"[main] Telegram: {e}")
+
     # ── Core command handler ──────────────────────────────────────────────────
 
     def _handle_text(self, text: str):
         """
-        Process a text command from any source (keyboard, mic, mobile, wake word).
+                Process a text command from any source (keyboard or mobile).
         Passes the rolling conversation history to the LLM so multi-turn
         exchanges work naturally:
           "open spotify"  →  "pause it"  →  "turn it up to 60"
@@ -236,98 +238,8 @@ class JarvisApp(Gtk.Application):
             self.window.set_thinking(False)
             self._processing.clear()
 
-    # ── Push-to-talk ──────────────────────────────────────────────────────────
-
-    def _voice_start(self):
-        """Mic button pressed: open stream and record until _mic_recording is cleared."""
-        try:
-            self._pa = pyaudio.PyAudio()
-            self._mic_audio = []
-            self._mic_stream = self._pa.open(
-                rate=16000, channels=1,
-                format=pyaudio.paInt16,
-                input=True, frames_per_buffer=1280,
-            )
-            self._mic_recording.set()
-            while self._mic_recording.is_set():
-                data = self._mic_stream.read(1280, exception_on_overflow=False)
-                self._mic_audio.append(np.frombuffer(data, dtype=np.int16))
-        except Exception as e:
-            self._mic_recording.clear()
-            GLib.idle_add(self.window.add_message, f"Mic error: {e}", MSG_SYSTEM)
-
-    def _voice_stop(self):
-        """Mic button released: stop recording, transcribe, dispatch."""
-        try:
-            # Stop the loop first — then close the stream safely
-            self._mic_recording.clear()
-
-            import time; time.sleep(0.08)   # let current read() finish
-
-            if self._mic_stream:
-                self._mic_stream.stop_stream()
-                self._mic_stream.close()
-                self._mic_stream = None
-            if self._pa:
-                self._pa.terminate()
-                self._pa = None
-
-            if not self._mic_audio:
-                GLib.idle_add(self.window.set_status, "READY", "idle")
-                return
-
-            audio = np.concatenate(self._mic_audio).astype(np.float32) / 32768.0
-
-            if self._listener is None:
-                self._listener = VoiceListener()
-
-            text, lang = self._listener.transcribe_once(audio)
-
-            if text:
-                GLib.idle_add(self.window.add_message, text, MSG_USER)
-                threading.Thread(
-                    target=self._handle_text, args=(text,), daemon=True
-                ).start()
-            else:
-                GLib.idle_add(self.window.set_status, "DIDN'T CATCH THAT", "idle")
-
-        except Exception as e:
-            GLib.idle_add(self.window.add_message, f"Voice error: {e}", MSG_SYSTEM)
-            GLib.idle_add(self.window.set_status, "READY", "idle")
-
-    # ── Wake word ─────────────────────────────────────────────────────────────
-
-    def _start_wake_listener(self):
-        self._listener = VoiceListener(
-            on_wake=self._on_wake_word,
-            on_transcript=self._on_wake_transcript,
-            on_listening_start=lambda: self.window.set_status("LISTENING...", "listening"),
-            on_listening_stop=lambda:  self.window.set_status("PROCESSING...", "thinking"),
-            on_error=lambda e: GLib.idle_add(
-                self.window.add_message, f"Voice: {e}", MSG_SYSTEM
-            ),
-        )
-        self._listener.start()
-
-    def _on_wake_word(self):
-        # Detect last used language so the ack is in the right tongue
-        lang = "en"
-        for role, text in reversed(self._history):
-            if role == "user":
-                lang = brain.detect_language(text)
-                break
-        tts.speak("Yes?" if lang == "en" else "Да?")
-        GLib.idle_add(self.window.set_status, "WAKE WORD DETECTED", "listening")
-
-    def _on_wake_transcript(self, text: str, lang: str):
-        GLib.idle_add(self.window.add_message, text, MSG_USER)
-        threading.Thread(
-            target=self._handle_text, args=(text,), daemon=True
-        ).start()
-
-
 def main():
-    app = JarvisApp()
+    app = SashaApp()
     return app.run(sys.argv)
 
 

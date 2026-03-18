@@ -46,7 +46,7 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#1a1110">
-<title>JARVIS</title>
+<title>SASHA</title>
 <style>
   :root {
     --bg:      #1a1110;
@@ -202,7 +202,7 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
 <header>
   <div class="dot" id="dot"></div>
   <div class="header-text">
-    <h1>JARVIS</h1>
+    <h1>SASHA</h1>
     <p id="backendLabel">CONNECTING...</p>
   </div>
 </header>
@@ -212,7 +212,7 @@ _MOBILE_HTML = r"""<!DOCTYPE html>
 
 <footer>
   <button class="btn" id="micBtn" title="Hold to speak">🎙</button>
-  <input id="input" type="text" placeholder="Ask Jarvis anything..."
+  <input id="input" type="text" placeholder="Ask Sasha anything..."
          autocomplete="off" autocorrect="off" spellcheck="false">
   <button class="btn" id="sendBtn" title="Send">➤</button>
 </footer>
@@ -357,7 +357,7 @@ function stopRecording() {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-addMessage('system', 'JARVIS MOBILE — connecting...');
+addMessage('system', 'SASHA MOBILE — connecting...');
 connect();
 </script>
 </body>
@@ -381,7 +381,7 @@ def _build_app(dispatch_fn: Callable[[str], str]):
             "Install with: pip install fastapi uvicorn --break-system-packages"
         )
 
-    app = FastAPI(title="Jarvis Mobile API", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Sasha Mobile API", docs_url=None, redoc_url=None)
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
@@ -420,14 +420,24 @@ def _build_app(dispatch_fn: Callable[[str], str]):
         _active_ws.append(ws)
         # Send backend info on connect
         import brain
-        await ws.send_json({"type": "backend", "label": brain.get_active_backend()})
+        try:
+            await ws.send_json({"type": "backend", "label": brain.get_active_backend()})
+        except Exception:
+            # Silently drop if send fails on connection
+            if ws in _active_ws:
+                _active_ws.remove(ws)
+            return
+        
         try:
             while True:
                 raw = await ws.receive_text()
                 msg = json.loads(raw)
 
                 if msg.get("type") == "ping":
-                    await ws.send_json({"type": "pong"})
+                    try:
+                        await ws.send_json({"type": "pong"})
+                    except Exception:
+                        break  # Connection lost, exit loop
                     continue
 
                 if msg.get("type") == "command":
@@ -436,7 +446,10 @@ def _build_app(dispatch_fn: Callable[[str], str]):
                         continue
 
                     # Acknowledge — show thinking indicator
-                    await ws.send_json({"type": "thinking"})
+                    try:
+                        await ws.send_json({"type": "thinking"})
+                    except Exception:
+                        break  # Connection lost
 
                     # Run in thread pool so we don't block the event loop
                     loop = asyncio.get_event_loop()
@@ -444,7 +457,11 @@ def _build_app(dispatch_fn: Callable[[str], str]):
                         import brain, dispatcher
                         intent = await loop.run_in_executor(None, brain.parse_intent, text)
                         reply  = await loop.run_in_executor(None, dispatcher.dispatch, intent, text)
-                        await ws.send_json({"type": "reply", "text": reply})
+                        
+                        try:
+                            await ws.send_json({"type": "reply", "text": reply})
+                        except Exception:
+                            break  # Connection lost
 
                         # Also speak on the desktop
                         try:
@@ -454,7 +471,10 @@ def _build_app(dispatch_fn: Callable[[str], str]):
                             pass
 
                     except Exception as e:
-                        await ws.send_json({"type": "error", "text": str(e)})
+                        try:
+                            await ws.send_json({"type": "error", "text": str(e)})
+                        except Exception:
+                            break  # Connection lost sending error
 
         except WebSocketDisconnect:
             pass

@@ -1,0 +1,29 @@
+[Unit]
+Description=Sasha Brain Bridge
+Documentation=https://github.com/user/Jarvis
+After=network-online.target ollama.service
+Wants=ollama.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sasha
+Group=sasha
+WorkingDirectory=/opt/sasha
+EnvironmentFile=/etc/sasha/env
+ExecStart=/opt/sasha/venv/bin/python -m server.run_server
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sasha-brain
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sasha
+
+[Install]
+WantedBy=multi-user.target

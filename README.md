@@ -194,6 +194,9 @@ systemd service). Environment variables always take precedence.
 | `MEMORY_ENABLED` | `True` | Enable learning system |
 | `MEMORY_MAX_INTERACTIONS` | `100` | How many past interactions to keep |
 | `MEMORY_INJECT_CONTEXT` | `True` | Inject learned facts into LLM prompts |
+| `JARVIS_SYSTEM_PROMPT` | *(empty)* | Extra global system prompt instructions |
+| `JARVIS_SYSTEM_PROMPT_EN` | *(empty)* | Extra English-only system prompt instructions |
+| `JARVIS_SYSTEM_PROMPT_RU` | *(empty)* | Extra Russian-only system prompt instructions |
 
 **Example `~/.config/jarvis/settings.env`:**
 ```env
@@ -203,7 +206,18 @@ WEATHER_LOCATION=London, England
 KDECONNECT_DEVICE=abc123def456
 MOBILE_SERVER_PORT=7123
 WHISPER_MODEL=small
+JARVIS_SYSTEM_PROMPT=Be concise and practical. Prefer actionable responses.
 ```
+
+You can also put long-form system instructions in:
+
+```text
+~/.config/jarvis/system_prompt.txt
+```
+
+When `main.py` starts, Sasha now verifies Ollama availability and model presence.
+If Ollama is down, it attempts to start it; if the configured model is missing,
+it attempts to pull it automatically before enabling local inference.
 
 ---
 
@@ -1170,3 +1184,128 @@ piper                TTS binary (~/.local/bin/piper)
 **Memory not persisting between sessions**
 - Check `~/.local/share/jarvis/memory.json` exists and is readable
 - Check `MEMORY_ENABLED = True` in `config.py`
+
+---
+
+## Hybrid Architecture (VPS Brain + Local Satellite)
+
+This repository now includes a modular split that supports a public VPS Brain
+and a private LAN Satellite (dial-out bridge, no inbound port forwarding).
+
+### Folder Structure Map
+
+```text
+jarvis/
+├── server/
+│   ├── __init__.py
+│   ├── brain.py            VPS NLP + intent parsing
+│   ├── dispatcher.py       VPS dispatcher (sends action requests to Satellite)
+│   ├── bridge.py           FastAPI WebSocket bridge (Satellite dials out)
+│   ├── protocol.py         JSON envelope + message factories
+│   ├── memory_store.py     VPS-persistent memory.json handling
+│   └── run_server.py       VPS server entry point
+├── satellite.py            Local client entry point (Arch/Hyprland)
+├── satellite_executor.py   Local tool runtime + registry (skills execution)
+├── brain.py                Compatibility shim -> server.brain
+└── dispatcher.py           Compatibility shim for local/in-process mode
+```
+
+### JSON Protocol (Brain <-> Satellite)
+
+All messages use the same envelope:
+
+```json
+{
+    "protocol": "1.0",
+    "id": "uuid",
+    "ts": "2026-03-18T12:34:56.000000+00:00",
+    "type": "message.type",
+    "payload": {}
+}
+```
+
+Satellite -> Brain message types:
+- `satellite.hello`: startup identity + capabilities (`tools`, audio/ui flags)
+- `satellite.status`: heartbeat/status updates
+- `satellite.input_text`: user text from mic/keyboard/mobile (`text`, `language`, `source`)
+- `satellite.audio_chunk`: reserved for streaming PCM/audio frames
+- `satellite.action_result`: response to `brain.execute_action` (`request_id`, `ok`, `result`, `error`)
+
+Brain -> Satellite message types:
+- `brain.execute_action`: tool call request (`tool`, `arguments`, `intent_action`)
+- `brain.speak_text`: TTS output request (`text`, `language`)
+- `brain.ui_update`: UI status/output update (`text`, `level`)
+- `brain.ping`: heartbeat probe
+
+Example action request:
+
+```json
+{
+    "protocol": "1.0",
+    "id": "8cae5c9d-2b71-4a88-95ec-b467a548f17b",
+    "ts": "2026-03-18T12:35:12.101112+00:00",
+    "type": "brain.execute_action",
+    "payload": {
+        "tool": "system.set_volume",
+        "arguments": {"value": "up"},
+        "intent_action": "set_volume"
+    }
+}
+```
+
+Example result:
+
+```json
+{
+    "protocol": "1.0",
+    "id": "9db7c4e2-76ac-4e55-a6de-f95d4d3ef643",
+    "ts": "2026-03-18T12:35:12.302929+00:00",
+    "type": "satellite.action_result",
+    "payload": {
+        "request_id": "8cae5c9d-2b71-4a88-95ec-b467a548f17b",
+        "ok": true,
+        "result": "Increasing volume."
+    }
+}
+```
+
+### Run Hybrid Mode
+
+On VPS (Brain):
+
+```bash
+python3 -m server.run_server
+```
+
+On local Arch machine (Satellite):
+
+```bash
+export JARVIS_SATELLITE_ID=basildon-main
+export JARVIS_BRIDGE_URL=ws://<vps-host>:8765/ws/satellite/basildon-main
+python3 satellite.py
+```
+
+### Memory Modernization
+
+In hybrid mode, memory is server-side and persistent on VPS via `server/memory_store.py`.
+Set a dedicated location with:
+
+```bash
+export JARVIS_MEMORY_FILE=/var/lib/jarvis/memory.json
+```
+
+This ensures intent context + history are available even while local rigs are offline.
+
+### Migration Guide: Skills Stay Local But Discoverable
+
+1. Keep OS-touching skills on Satellite (`skills/apps.py`, `skills/system.py`, `skills/files.py`, etc.).
+2. Register callable tool names in `satellite_executor.py` (`TOOL_REGISTRY`).
+3. Ensure each tool has JSON-serializable arguments and returns a plain string.
+4. Brain dispatcher (`server/dispatcher.py`) maps each intent action to a tool name + args.
+5. Satellite announces available tools in `satellite.hello.payload.capabilities.tools`.
+6. Brain can enforce capability checks before dispatching (future hardening).
+7. To add a new skill:
+     - Implement local function in `skills/<domain>.py`
+     - Add it to `TOOL_REGISTRY` in `satellite_executor.py`
+     - Add action mapping in `server/dispatcher.py`
+     - Add prompt/examples in `server/brain.py` for reliable intent extraction

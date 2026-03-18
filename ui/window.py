@@ -1,10 +1,9 @@
 """
 ui/window.py
 ------------
-Jarvis GTK4 main window.
+Sasha GTK4 main window.
 - Chat-style message history
 - Text input with send button
-- Push-to-talk mic button
 - Status bar showing current state
 - Reloads Matugen theme on startup
 """
@@ -16,8 +15,6 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Pango, Gdk
 
 import threading
-import numpy as np
-import time
 from datetime import datetime
 from typing import Callable
 
@@ -31,19 +28,13 @@ MSG_JARVIS = "jarvis"
 MSG_SYSTEM = "system"
 
 
-class JarvisWindow(Gtk.ApplicationWindow):
+class SashaWindow(Gtk.ApplicationWindow):
 
     def __init__(self, app: Gtk.Application,
-                 on_text_input: Callable[[str], None],
-                 on_voice_start: Callable[[], None],
-                 on_voice_stop:  Callable[[], None]):
+                 on_text_input: Callable[[str], None]):
         super().__init__(application=app, title=config.WINDOW_TITLE)
 
         self.on_text_input  = on_text_input
-        self.on_voice_start = on_voice_start
-        self.on_voice_stop  = on_voice_stop
-
-        self._mic_active = False
 
         self.set_default_size(config.WINDOW_DEFAULT_WIDTH, config.WINDOW_DEFAULT_HEIGHT)
         self.add_css_class("jarvis-window")
@@ -125,19 +116,10 @@ class JarvisWindow(Gtk.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         box.add_css_class("jarvis-input-area")
 
-        # Mic button — use GestureClick for press/release (GTK4)
-        self._mic_btn = Gtk.Button(label="🎙")
-        self._mic_btn.add_css_class("mic-button")
-        gesture = Gtk.GestureClick()
-        gesture.connect("pressed",  self._on_mic_press)
-        gesture.connect("released", self._on_mic_release)
-        self._mic_btn.add_controller(gesture)
-        box.append(self._mic_btn)
-
         # Text entry
         self._entry = Gtk.Entry()
         self._entry.add_css_class("jarvis-entry")
-        self._entry.set_placeholder_text("Ask Jarvis anything...")
+        self._entry.set_placeholder_text("Ask Sasha anything...")
         self._entry.set_hexpand(True)
         self._entry.connect("activate", self._on_send)
         box.append(self._entry)
@@ -222,10 +204,10 @@ class JarvisWindow(Gtk.ApplicationWindow):
         GLib.idle_add(_do)
 
     def _show_welcome(self):
-        self.add_message("JARVIS ONLINE", MSG_SYSTEM)
+        self.add_message(f"{config.ASSISTANT_NAME.upper()} ONLINE", MSG_SYSTEM)
         self.add_message(
             "Good day. I'm online and ready to assist. "
-            "You can type or say 'Jarvis' to wake me.",
+            "Type your request and I will take it from there.",
             MSG_JARVIS
         )
 
@@ -242,19 +224,6 @@ class JarvisWindow(Gtk.ApplicationWindow):
             args=(text,),
             daemon=True
         ).start()
-
-    def _on_mic_press(self, *_):
-        self._mic_active = True
-        self._mic_btn.add_css_class("recording")
-        self.set_status("LISTENING", "listening")
-        threading.Thread(target=self.on_voice_start, daemon=True).start()
-
-    def _on_mic_release(self, *_):
-        if self._mic_active:
-            self._mic_active = False
-            self._mic_btn.remove_css_class("recording")
-            self.set_status("PROCESSING", "thinking")
-            threading.Thread(target=self.on_voice_stop, daemon=True).start()
 
     # ── Status updates ────────────────────────────────────────────────────────
 

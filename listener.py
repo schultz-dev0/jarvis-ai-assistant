@@ -176,22 +176,53 @@ class VoiceListener:
     def _load_models(self) -> bool:
         """Load openwakeword (optional) and faster-whisper."""
 
+        wake_disabled = os.environ.get("JARVIS_DISABLE_WAKEWORD", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
         # ── Wake word ─────────────────────────────────────────────────────────
         # Non-fatal: if the model can't be loaded, push-to-talk still works.
         try:
+            if wake_disabled:
+                print("[listener] Wake word disabled by JARVIS_DISABLE_WAKEWORD")
+                raise RuntimeError("wakeword disabled")
+
             from openwakeword.model import Model as OWWModel
 
             model_name = config.WAKE_WORD_MODEL
 
-            # Pass the name directly. Newer openwakeword versions auto-download
-            # missing models from the HuggingFace hub seamlessly.
-            try:
-                self._oww_model = OWWModel(wakeword_models=[model_name])
-            except TypeError:
-                self._oww_model = OWWModel([model_name])
+            # openwakeword API differs across versions. Current versions expose
+            # built-in models when Model() is constructed with no args.
+            self._oww_model = OWWModel()
+            available = list(getattr(self._oww_model, "models", {}).keys())
 
-            self._oww_key = model_name
-            print(f"[listener] Wake word loaded: '{model_name}'")
+            alias_map = {
+                "jarvis": "hey_jarvis",
+                "hey jarvis": "hey_jarvis",
+            }
+            resolved_name = alias_map.get(model_name.lower().strip(), model_name)
+
+            if resolved_name in available:
+                self._oww_key = resolved_name
+                if resolved_name != model_name:
+                    print(
+                        f"[listener] Wake word '{model_name}' not available; "
+                        f"using '{resolved_name}'"
+                    )
+                else:
+                    print(f"[listener] Wake word loaded: '{resolved_name}'")
+            elif available:
+                self._oww_key = available[0]
+                print(
+                    f"[listener] Wake word '{model_name}' not found. "
+                    f"Using '{self._oww_key}' from available models."
+                )
+            else:
+                print("[listener] openwakeword loaded but no models are available")
+                self._oww_model = None
 
         except Exception as e:
             print(f"[listener] Wake word unavailable ({e}) — push-to-talk still works")

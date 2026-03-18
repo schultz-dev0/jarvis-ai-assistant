@@ -17,9 +17,10 @@ from pathlib import Path
 
 import config
 
-_tts_queue: queue.Queue[str | None] = queue.Queue()
+_tts_queue: queue.Queue[str | None] = queue.Queue(maxsize=5)  # Bounded queue to prevent accumulation
 _tts_thread: threading.Thread | None = None
 _speaking = threading.Event()
+_queue_lock = threading.Lock()  # Protect queue access from multiple threads
 
 
 def _detect_language(text: str) -> str:
@@ -86,16 +87,28 @@ def start():
 
 
 def speak(text: str):
-    """Queue text for speech (non-blocking)."""
+    """Queue text for speech (non-blocking). Interrupts any existing speech."""
     if not text:
         return
-    # Clear existing queue (interrupt current speech)
-    while not _tts_queue.empty():
+    
+    with _queue_lock:
+        # Clear existing queue atomically (interrupt current speech)
         try:
-            _tts_queue.get_nowait()
+            while True:
+                _tts_queue.get_nowait()
         except queue.Empty:
-            break
-    _tts_queue.put(text)
+            pass
+        
+        # Queue new text, dropping oldest if queue is full
+        try:
+            _tts_queue.put(text, block=False)
+        except queue.Full:
+            # Drop oldest item and retry
+            try:
+                _tts_queue.get_nowait()
+                _tts_queue.put(text, block=False)
+            except queue.Empty:
+                pass
 
 
 def is_speaking() -> bool:

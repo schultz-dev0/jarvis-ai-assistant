@@ -1,7 +1,7 @@
 """
 skills/memory.py
 ----------------
-Jarvis learning and memory system.
+Sasha learning and memory system.
 
 Remembers:
   - App usage frequency (learns your most-used apps)
@@ -19,8 +19,7 @@ from __future__ import annotations
 import json
 import time
 import re
-from pathlib import Path
-from typing import Any
+from datetime import datetime, timezone
 
 import config
 
@@ -29,7 +28,8 @@ import config
 def _load() -> dict:
     if config.MEMORY_FILE.exists():
         try:
-            return json.loads(config.MEMORY_FILE.read_text(encoding="utf-8"))
+            data = json.loads(config.MEMORY_FILE.read_text(encoding="utf-8"))
+            return _migrate_schema(data)
         except Exception:
             pass
     return _blank_memory()
@@ -41,10 +41,43 @@ def _blank_memory() -> dict:
         "preferred_location":  "",   # last / most-used weather city
         "location_counts":     {},   # city → count
         "facts":               {},   # arbitrary user facts
+        "facts_meta":          {},   # fact_key -> {value, created_at, updated_at, source}
         "corrections":         {},   # original_text → corrected_text
         "interactions":        [],   # last N full interaction records
-        "schema_version":      1,
+        "schema_version":      2,
     }
+
+
+def _migrate_schema(data: dict) -> dict:
+    base = _blank_memory()
+    base.update(data if isinstance(data, dict) else {})
+
+    schema = int(base.get("schema_version") or 1)
+    now_ts = time.time()
+
+    if not isinstance(base.get("facts"), dict):
+        base["facts"] = {}
+    if not isinstance(base.get("facts_meta"), dict):
+        base["facts_meta"] = {}
+
+    if schema < 2:
+        # Backfill metadata for existing facts so freshest memory can be ranked.
+        for key, value in base["facts"].items():
+            norm_key = str(key).strip().lower()
+            if not norm_key:
+                continue
+            base["facts_meta"][norm_key] = {
+                "value": str(value),
+                "created_at": now_ts,
+                "updated_at": now_ts,
+                "source": "migration",
+            }
+        base["schema_version"] = 2
+
+    if not isinstance(base.get("interactions"), list):
+        base["interactions"] = []
+
+    return base
 
 
 def _save(data: dict):
@@ -52,6 +85,29 @@ def _save(data: dict):
     config.MEMORY_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def _upsert_fact(data: dict, key: str, value: str, source: str = "manual"):
+    now_ts = time.time()
+    norm_key = key.strip().lower()
+    if not norm_key:
+        return
+
+    data["facts"][norm_key] = value.strip()
+
+    facts_meta = data.setdefault("facts_meta", {})
+    prev = facts_meta.get(norm_key)
+    created_at = prev.get("created_at", now_ts) if isinstance(prev, dict) else now_ts
+    facts_meta[norm_key] = {
+        "value": value.strip(),
+        "created_at": created_at,
+        "updated_at": now_ts,
+        "source": source,
+    }
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -93,11 +149,20 @@ def record_interaction(
         "input":   user_input,
         "action":  action,
         "target":  target,
+        "result":  result,
         "lang":    lang,
         "success": success,
     }
     data["interactions"].append(record)
-    # Trim to limit
+
+    # Trim by retention window first, then by count cap.
+    cutoff = time.time() - (config.MEMORY_RETENTION_DAYS * 86400)
+    data["interactions"] = [
+        r for r in data["interactions"]
+        if isinstance(r, dict) and float(r.get("ts", 0.0)) >= cutoff
+    ]
+
+    # Trim to max rolling limit
     data["interactions"] = data["interactions"][-config.MEMORY_MAX_INTERACTIONS:]
 
     _save(data)
@@ -111,7 +176,7 @@ def store_fact(key: str, value: str):
     These are injected into LLM context hints.
     """
     data = _load()
-    data["facts"][key.strip().lower()] = value.strip()
+    _upsert_fact(data, key, value, source="manual")
     _save(data)
 
 
@@ -153,10 +218,22 @@ def get_context_hint(lang: str = "en") -> str:
         else:
             hints.append(f"Frequently used apps: {app_str}")
 
-    # User facts
-    facts = data.get("facts", {})
-    for k, v in list(facts.items())[:5]:
-        hints.append(f"{k}: {v}")
+    # Most recently updated facts with date stamps.
+    facts_meta = data.get("facts_meta", {})
+    if isinstance(facts_meta, dict) and facts_meta:
+        recent_facts = sorted(
+            [
+                (k, v)
+                for k, v in facts_meta.items()
+                if isinstance(v, dict) and "value" in v
+            ],
+            key=lambda item: float(item[1].get("updated_at", 0.0)),
+            reverse=True,
+        )[:config.MEMORY_RECENT_FACTS_LIMIT]
+        for key, meta in recent_facts:
+            ts = float(meta.get("updated_at", 0.0))
+            stamp = _iso(ts) if ts > 0 else "unknown-date"
+            hints.append(f"{key}: {meta.get('value','')} (updated {stamp})")
 
     if not hints:
         return ""
@@ -171,6 +248,28 @@ def get_top_apps(n: int = 5) -> list[str]:
     data = _load()
     sorted_apps = sorted(data.get("app_usage", {}).items(), key=lambda x: -x[1])
     return [a for a, _ in sorted_apps[:n]]
+
+
+def get_recent_facts(n: int = 8) -> list[tuple[str, str, float]]:
+    """Return freshest facts as (key, value, updated_ts), newest first."""
+    data = _load()
+    facts_meta = data.get("facts_meta", {})
+    if not isinstance(facts_meta, dict):
+        return []
+
+    recent = sorted(
+        [
+            (k, v)
+            for k, v in facts_meta.items()
+            if isinstance(v, dict) and "value" in v
+        ],
+        key=lambda item: float(item[1].get("updated_at", 0.0)),
+        reverse=True,
+    )[:n]
+    return [
+        (key, str(meta.get("value", "")), float(meta.get("updated_at", 0.0)))
+        for key, meta in recent
+    ]
 
 
 def get_preferred_location() -> str:
@@ -206,7 +305,9 @@ def extract_and_store_facts(user_input: str, lang: str = "en"):
     for pattern, fact_key in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            store_fact(fact_key, m.group(1).strip())
+            data = _load()
+            _upsert_fact(data, fact_key, m.group(1).strip(), source="auto-extract")
+            _save(data)
 
 
 def get_recent_summary(n: int = 5, lang: str = "en") -> str:
@@ -218,7 +319,7 @@ def get_recent_summary(n: int = 5, lang: str = "en") -> str:
 
     lines = []
     for r in reversed(recent):
-        ts = time.strftime("%H:%M", time.localtime(r["ts"]))
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"]))
         lines.append(f"  {ts}  {r['action']}({r.get('target','')})  ← \"{r['input'][:40]}\"")
 
     header = "Recent history:" if lang == "en" else "Недавние команды:"
